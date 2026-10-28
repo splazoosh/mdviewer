@@ -1,0 +1,77 @@
+[package]
+name = "mdviewer"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+license = "MIT"
+description = "A repository-level markdown editor with a prompt library"
+publish = false
+repository = "https://github.com/splazoosh/mdviewer"
+
+[dependencies]
+anyhow = "1.0.103"
+directories = "6.0.0"
+eframe = "0.35.0"
+egui = "0.35.0"
+serde_json = "1.0.150"
+tracing = "0.1.44"
+
+[dependencies.serde]
+version = "1.0.228"
+features = ["derive"]
+
+[dependencies.tracing-subscriber]
+version = "0.3.23"
+features = ["env-filter"]
+
+[dependencies.rfd]
+version = "0.17.2"
+default-features = false
+features = ["gtk3"]
+
+[dependencies.arboard]
+version = "3.6.1"
+default-features = false
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[lints.rust]
+missing_docs = "warn"
+
+[lints.rustdoc]
+broken_intra_doc_links = "warn"
+private_intra_doc_links = "warn"
+
+[lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+
+[lints.clippy.correctness]
+level = "deny"
+priority = -1
+
+[lints.clippy.suspicious]
+level = "warn"
+priority = -1
+
+[lints.clippy.style]
+level = "warn"
+priority = -1
+
+[lints.clippy.complexity]
+level = "warn"
+priority = -1
+
+[lints.clippy.perf]
+level = "warn"
+priority = -1
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+
+[profile.dev.package."*"]
+opt-level = 3
