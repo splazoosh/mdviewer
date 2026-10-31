@@ -3,6 +3,7 @@
 
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, TryRecvError};
 use std::time::SystemTime;
 
 use eframe::CreationContext;
@@ -124,6 +125,8 @@ pub(crate) struct ViewerApp {
     /// Applied by the editor pane once the file is the open document.
     jump: Option<Jump>,
     prompt: Option<Prompt>,
+    /// The open folder dialog's answer, once it is given.
+    folder_pick: Option<mpsc::Receiver<Option<PathBuf>>>,
     /// Set once the user has confirmed a close so the next close request is
     /// not intercepted again.
     quit_confirmed: bool,
@@ -156,6 +159,7 @@ impl ViewerApp {
             selection: None,
             jump: None,
             prompt: None,
+            folder_pick: None,
             quit_confirmed: false,
             error: None,
         };
@@ -181,7 +185,10 @@ impl ViewerApp {
         }
     }
 
+    /// Every way in — the dialog, the command line, the last repository
+    /// remembered — comes through here, so the root is normalised once.
     fn open_repository(&mut self, root: PathBuf) {
+        let root = normalise_root(root);
         let tree = match Node::scan(&root) {
             Ok(tree) => tree,
             Err(error) => {
@@ -204,13 +211,46 @@ impl ViewerApp {
         self.error = None;
     }
 
-    fn pick_repository(&mut self) {
+    /// Shows the folder dialog on its own thread, so the window keeps
+    /// drawing while it is open; [`Self::poll_folder_pick`] takes the answer.
+    fn pick_repository(&mut self, ctx: &egui::Context) {
+        if self.folder_pick.is_some() {
+            return;
+        }
         let mut dialog = rfd::FileDialog::new().set_title("Open repository");
         if let Some(repo) = &self.repo {
             dialog = dialog.set_directory(&repo.root);
         }
-        if let Some(root) = dialog.pick_folder() {
-            self.open_repository(root);
+        let (tx, rx) = mpsc::channel();
+        let ctx = ctx.clone();
+        let spawned = std::thread::Builder::new()
+            .name("folder-dialog".to_owned())
+            .spawn(move || {
+                let _ = tx.send(dialog.pick_folder());
+                ctx.request_repaint();
+            });
+        match spawned {
+            Ok(_) => self.folder_pick = Some(rx),
+            Err(error) => self.report(format!("failed to open the folder dialog: {error}")),
+        }
+    }
+
+    fn poll_folder_pick(&mut self) {
+        let Some(rx) = &self.folder_pick else {
+            return;
+        };
+        match rx.try_recv() {
+            Err(TryRecvError::Empty) => {}
+            Ok(picked) => {
+                self.folder_pick = None;
+                if let Some(root) = picked {
+                    self.open_repository(root);
+                }
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.folder_pick = None;
+                self.report("the folder dialog failed");
+            }
         }
     }
 
@@ -315,9 +355,10 @@ impl ViewerApp {
     fn menu_bar(&mut self, ui: &mut egui::Ui) {
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("File", |ui| {
-                if ui.button("Open repository…").clicked() {
+                let open = egui::Button::new("Open repository…");
+                if ui.add_enabled(self.folder_pick.is_none(), open).clicked() {
                     ui.close();
-                    self.pick_repository();
+                    self.pick_repository(&ui.ctx().clone());
                 }
                 if ui
                     .add_enabled(self.repo.is_some(), egui::Button::new("Rescan"))
@@ -353,8 +394,9 @@ impl ViewerApp {
 
     fn tree_pane(&mut self, ui: &mut egui::Ui, focus_search: bool) {
         ui.horizontal(|ui| {
-            if ui.button("Open…").clicked() {
-                self.pick_repository();
+            let open = egui::Button::new("Open…");
+            if ui.add_enabled(self.folder_pick.is_none(), open).clicked() {
+                self.pick_repository(&ui.ctx().clone());
             }
             let mut order = self.settings.sort;
             egui::ComboBox::from_id_salt("sort_key")
@@ -382,7 +424,7 @@ impl ViewerApp {
                     .hint_text("search files (Ctrl+Shift+F)")
                     .desired_width(ui.available_width() - 28.0),
             );
-            if response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                 self.search.query.clear();
             }
             if ui
@@ -610,7 +652,7 @@ impl ViewerApp {
                         }
                         if ui.button("Cancel").clicked() {
                             resolved = true;
-                            self.jump = None;
+                            self.cancel_prompt();
                         }
                     });
                 }
@@ -639,6 +681,7 @@ impl ViewerApp {
                         }
                         if ui.button("Cancel").clicked() {
                             resolved = true;
+                            self.cancel_prompt();
                         }
                     });
                 }
@@ -647,6 +690,13 @@ impl ViewerApp {
         if resolved && self.prompt.as_ref() == Some(&prompt) {
             self.prompt = None;
         }
+    }
+
+    /// Cancel on any prompt, also given by Escape: the prompt goes and
+    /// nothing else happens.
+    fn cancel_prompt(&mut self) {
+        self.jump = None;
+        self.prompt = None;
     }
 
     /// What the user was trying to do when the unsaved-changes prompt got in
@@ -661,6 +711,28 @@ impl ViewerApp {
             Prompt::ChangedOnDisk => {}
         }
     }
+}
+
+/// `root` made absolute, with `.`, `..` and symbolic links resolved. On
+/// Windows the `\\?\` prefix is left off wherever the plain form names the
+/// same directory. A root that cannot be resolved is kept as given; the scan
+/// then reports why.
+fn normalise_root(root: PathBuf) -> PathBuf {
+    let Ok(resolved) = dunce::canonicalize(&root) else {
+        return root;
+    };
+    match plain_unc(&resolved) {
+        Some(plain) if std::fs::canonicalize(&plain).is_ok_and(|p| p == resolved) => plain,
+        _ => resolved,
+    }
+}
+
+/// `\\?\UNC\server\share\dir` as `\\server\share\dir`, within the 259
+/// UTF-16 units (260 with the terminating NUL) every Windows API accepts.
+fn plain_unc(path: &Path) -> Option<PathBuf> {
+    let rest = path.to_str()?.strip_prefix(r"\\?\UNC\")?;
+    let plain = format!(r"\\{rest}");
+    (plain.encode_utf16().count() < 260).then(|| PathBuf::from(plain))
 }
 
 /// `  12  …text before match text after…` with the match in strong colour.
@@ -780,6 +852,13 @@ impl eframe::App for ViewerApp {
             egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
             egui::Key::F,
         );
+        if self.prompt.is_some()
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+        {
+            self.cancel_prompt();
+        }
+        self.poll_folder_pick();
+
         let (mut save_requested, mut clip_requested, focus_search) = ctx.input_mut(|i| {
             (
                 i.consume_shortcut(&save_shortcut),
@@ -869,6 +948,143 @@ impl eframe::App for ViewerApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Draws one frame of `app` with Escape pressed.
+    fn press_escape(ctx: &egui::Context, app: &mut ViewerApp) {
+        use eframe::App as _;
+        let input = egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        };
+        let mut frame = eframe::Frame::_new_kittest();
+        let _ = ctx.run_ui(input, |ui| app.ui(ui, &mut frame));
+    }
+
+    #[test]
+    fn escape_cancels_every_prompt() {
+        let ctx = egui::Context::default();
+        let cc = CreationContext::_new_kittest(ctx.clone());
+        let mut app = ViewerApp::new(&cc, None, None);
+        for prompt in [
+            Prompt::UnsavedThenOpen(PathBuf::from("other.md")),
+            Prompt::UnsavedThenQuit,
+            Prompt::ChangedOnDisk,
+        ] {
+            app.prompt = Some(prompt.clone());
+            app.jump = Some(Jump {
+                path: PathBuf::from("other.md"),
+                line: 1,
+                column: 0,
+                len: 1,
+            });
+            press_escape(&ctx, &mut app);
+            assert_eq!(app.prompt, None, "{prompt:?}");
+            assert_eq!(app.jump, None, "{prompt:?}");
+            assert!(app.document.is_none() && !app.quit_confirmed, "{prompt:?}");
+        }
+    }
+
+    #[test]
+    fn escape_on_a_prompt_leaves_the_search_box_alone() -> std::io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let ctx = egui::Context::default();
+        let cc = CreationContext::_new_kittest(ctx.clone());
+        let mut app = ViewerApp::new(&cc, None, Some(dir.path().to_path_buf()));
+        for prompt in [None, Some(Prompt::ChangedOnDisk)] {
+            app.search.query = "query".to_owned();
+            app.prompt = None;
+            let mut frame = eframe::Frame::_new_kittest();
+            let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                use eframe::App as _;
+                app.ui(ui, &mut frame);
+            });
+            ctx.memory_mut(|m| m.request_focus(egui::Id::new("repo_search")));
+            app.prompt = prompt.clone();
+            press_escape(&ctx, &mut app);
+            let expected = if prompt.is_some() { "query" } else { "" };
+            assert_eq!(app.search.query, expected, "{prompt:?}");
+            assert_eq!(app.prompt, None, "{prompt:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_picked_folder_opens_when_the_dialog_answers() -> std::io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        std::fs::create_dir(dir.path().join("foo"))?;
+        let ctx = egui::Context::default();
+        let cc = CreationContext::_new_kittest(ctx);
+        let mut app = ViewerApp::new(&cc, None, None);
+        let (tx, rx) = mpsc::channel();
+        app.folder_pick = Some(rx);
+        app.poll_folder_pick();
+        assert!(app.folder_pick.is_some() && app.repo.is_none());
+        let _ = tx.send(Some(dir.path().join("foo").join("..")));
+        app.poll_folder_pick();
+        assert!(app.folder_pick.is_none());
+        let root = app.repo.as_ref().map(|r| r.root.clone());
+        assert_eq!(root, Some(normalise_root(dir.path().to_path_buf())));
+        Ok(())
+    }
+
+    #[test]
+    fn a_dialog_that_dies_is_reported() {
+        let ctx = egui::Context::default();
+        let cc = CreationContext::_new_kittest(ctx);
+        let mut app = ViewerApp::new(&cc, None, None);
+        let (tx, rx) = mpsc::channel::<Option<PathBuf>>();
+        app.folder_pick = Some(rx);
+        drop(tx);
+        app.poll_folder_pick();
+        assert!(app.folder_pick.is_none());
+        assert_eq!(app.error.as_deref(), Some("the folder dialog failed"));
+    }
+
+    #[test]
+    fn root_is_normalised() -> std::io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        std::fs::create_dir(dir.path().join("foo"))?;
+        std::fs::create_dir(dir.path().join("folder"))?;
+        let clean = normalise_root(dir.path().join("folder"));
+        assert_eq!(
+            normalise_root(dir.path().join("foo").join("..").join("folder")),
+            clean
+        );
+        assert!(clean.is_absolute());
+        assert!(!clean.to_string_lossy().starts_with(r"\\?\"));
+        assert!(clean.components().all(|c| matches!(
+            c,
+            std::path::Component::Prefix(_)
+                | std::path::Component::RootDir
+                | std::path::Component::Normal(_)
+        )));
+        Ok(())
+    }
+
+    #[test]
+    fn a_share_is_named_plainly() {
+        assert_eq!(
+            plain_unc(Path::new(r"\\?\UNC\server\share\notes")),
+            Some(PathBuf::from(r"\\server\share\notes"))
+        );
+        assert_eq!(plain_unc(Path::new(r"\\server\share\notes")), None);
+        let at = |tail: String| plain_unc(Path::new(&format!(r"\\?\UNC\server\share\{tail}")));
+        assert!(at("a".repeat(244)).is_some());
+        assert_eq!(at("a".repeat(245)), None);
+        assert_eq!(at(format!("{}😀", "a".repeat(243))), None);
+    }
+
+    #[test]
+    fn unresolvable_root_is_kept() {
+        let missing = PathBuf::from("no-such-dir").join("..").join("x");
+        assert_eq!(normalise_root(missing.clone()), missing);
+    }
 
     #[test]
     fn sizes_are_humanised() {

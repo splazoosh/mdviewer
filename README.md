@@ -73,7 +73,9 @@ The app's own state lives in `%APPDATA%\mdviewer\` on Windows and in
 - Search reads the files as saved and holds them all in memory; the first
   500 hits are listed and the rest counted.
 - On Linux, text copied with **Copy** is held by the app and is gone once
-  the app closes, unless a clipboard manager keeps it.
+  the app closes, unless a clipboard manager keeps it. Under Wayland it goes
+  through the compositor's data-control protocol (`ext-` or `wlr-`); a
+  compositor without one is served through XWayland instead.
 
 ## Licence
 
